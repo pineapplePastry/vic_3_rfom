@@ -1,0 +1,166 @@
+name: Initialize Mod Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      MOD_NAME:
+        description: 'Name of the mod (defaults to repo name if not provided)'
+        required: false
+        type: string
+      MOD_VERSION:
+        description: 'Version of the mod (version field in metadata.json)'
+        required: false
+        default: '0.1.0'
+        type: string
+      SUPPORTED_GAME_VERSION:
+        description: 'Game version the mod supports (supported_game_version field in metadata.json). Example: 1.12.* (leave empty to preserve existing)'
+        required: false
+        default: '1.14.*'
+        type: string
+      MOD_TAGS:
+        description: |
+          Tags for the mod (tags field in metadata.json).
+          Select any combination of the following, separated by commas (capitalisation is not important):
+          Alternative History, Balance, Cultures And Religions, Diplomacy, Events, Expansion, Economy And Buildings, Fixes, Flags, Gameplay, Graphics, Historical, Interest Groups, Journal Entries, Map, New Nations, Pops, Sound, Technologies, Total Conversion, Trade, Translation, Utilities
+        required: false
+        type: string
+      MOD_PICTURE:
+        description: 'Picture for the mod (picture field in metadata.json)'
+        required: false
+        default: 'thumbnail.png'
+        type: string
+      MOD_DESCRIPTION:
+        description: 'Short description of the mod (leave empty to preserve existing)'
+        required: false
+        type: string
+
+# The workflow pushes a commit, so it needs write access. Declaring it here means
+# you do not have to change the repository's Actions settings.
+permissions:
+  contents: write
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Inputs are passed through env rather than pasted into the script, so
+      # quotes or $ characters typed into a field cannot break (or hijack) the shell.
+      - name: Determine mod name
+        id: modname
+        env:
+          REPO_NAME: ${{ github.repository }}
+          MOD_NAME: ${{ inputs.MOD_NAME }}
+        run: |
+          if [[ -n "$MOD_NAME" ]]; then
+            name="$MOD_NAME"
+          else
+            name="${REPO_NAME##*/}"
+          fi
+          # A name must stay on one line
+          name=$(printf '%s' "$name" | tr -d '\r\n')
+          printf 'name=%s\n' "$name" >> "$GITHUB_OUTPUT"
+
+      - name: Validate supported game version
+        if: ${{ inputs.SUPPORTED_GAME_VERSION != '' }}
+        env:
+          SUPPORTED_GAME_VERSION: ${{ inputs.SUPPORTED_GAME_VERSION }}
+        run: |
+          # Accepts forms such as 1.12.*, 1.12.3 or 1.12
+          if [[ ! "$SUPPORTED_GAME_VERSION" =~ ^[0-9]+\.[0-9]+(\.([0-9]+|\*))?$ ]]; then
+            echo "::error::SUPPORTED_GAME_VERSION must look like 1.12.* or 1.12.3. Provided: $SUPPORTED_GAME_VERSION"
+            exit 1
+          fi
+
+      - name: Validate tags
+        if: ${{ inputs.MOD_TAGS != '' }}
+        env:
+          MOD_TAGS: ${{ inputs.MOD_TAGS }}
+        run: |
+          # To support a new tag, add it to this list (and to the MOD_TAGS description above)
+          allowed=(
+            "Alternative History" "Balance" "Cultures And Religions" "Diplomacy" "Events"
+            "Expansion" "Economy And Buildings" "Fixes" "Flags" "Gameplay" "Graphics"
+            "Historical" "Interest Groups" "Journal Entries" "Map" "New Nations" "Pops"
+            "Sound" "Technologies" "Total Conversion" "Trade" "Translation" "Utilities"
+          )
+
+          IFS=',' read -ra raw_tags <<< "$MOD_TAGS"
+          result=()
+          for tag in "${raw_tags[@]}"; do
+            # Trim surrounding whitespace
+            clean="${tag#"${tag%%[![:space:]]*}"}"
+            clean="${clean%"${clean##*[![:space:]]}"}"
+            [[ -z "$clean" ]] && continue
+
+            # Match ignoring capitalisation, but store the official spelling
+            match=""
+            for a in "${allowed[@]}"; do
+              if [[ "${a,,}" == "${clean,,}" ]]; then
+                match="$a"
+              fi
+            done
+            if [[ -z "$match" ]]; then
+              echo "::error::Invalid tag '$clean'"
+              exit 1
+            fi
+            result+=("$match")
+          done
+
+          if (( ${#result[@]} > 0 )); then
+            tags_json=$(printf '%s\n' "${result[@]}" | jq -R . | jq -sc .)
+            echo "TAGS_JSON=$tags_json" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update metadata.json
+        env:
+          MODNAME: ${{ steps.modname.outputs.name }}
+          MOD_VERSION: ${{ inputs.MOD_VERSION }}
+          SUPPORTED_GAME_VERSION: ${{ inputs.SUPPORTED_GAME_VERSION }}
+          MOD_PICTURE: ${{ inputs.MOD_PICTURE }}
+          MOD_DESCRIPTION: ${{ inputs.MOD_DESCRIPTION }}
+          MOD_ID: com.github.${{ github.repository_owner }}.${{ github.event.repository.name }}
+          TAGS_JSON: ${{ env.TAGS_JSON }}
+        run: |
+          file="mod/.metadata/metadata.json"
+          if [[ ! -f "$file" ]]; then
+            echo "::error::File $file does not exist."
+            exit 1
+          fi
+
+          # jq builds the JSON, so quotes and backslashes in the inputs are escaped correctly.
+          # Empty inputs fall back to whatever the file already contains.
+          jq --arg name "$MODNAME" \
+             --arg id "$MOD_ID" \
+             --arg version "$MOD_VERSION" \
+             --arg picture "$MOD_PICTURE" \
+             --arg game_version "$SUPPORTED_GAME_VERSION" \
+             --arg description "$MOD_DESCRIPTION" \
+             --argjson new_tags "${TAGS_JSON:-null}" \
+             '{
+                name: $name,
+                id: $id,
+                version: $version,
+                game_id: "victoria3",
+                picture: $picture,
+                supported_game_version: (if $game_version != "" then $game_version else (.supported_game_version // "1.12.*") end),
+                short_description: (if $description != "" then $description else (.short_description // "") end),
+                tags: ($new_tags // .tags // []),
+                relationships: (.relationships // []),
+                game_custom_data: { multiplayer_synchronized: true }
+              }' "$file" > "$file.tmp"
+          mv "$file.tmp" "$file"
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "${{ github.actor_id }}+github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Initialize mod template with repo name and description"
+          git push
